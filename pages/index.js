@@ -19,90 +19,131 @@ export default function Home() {
   const [log, setLog] = useState("");
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    // get initial session
+    supabase.auth.getSession().then(({ data }) => setSession(data?.session || null));
+    // listen for changes
     const { data: listener } = supabase.auth.onAuthStateChange((_event, s) => {
       setSession(s);
     });
     return () => listener?.subscription?.unsubscribe();
   }, []);
 
+  const appendLog = (txt) => {
+    setLog((p) => `${p}${p ? "\n" : ""}${txt}`);
+  };
+
   async function signup() {
-    setLog("Creando usuario...");
+    appendLog("Creando usuario...");
     const { error } = await supabase.auth.signUp({ email, password });
-    if (error) setLog("Signup error: " + error.message);
-    else setLog("Signup enviado: revisá tu email (si está habilitado).");
+    if (error) appendLog("Signup error: " + error.message);
+    else appendLog("Signup enviado: revisá tu email (si está habilitado).");
   }
 
   async function login() {
-    setLog("Logueando...");
+    appendLog("Logueando...");
     const { error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) setLog("Login error: " + error.message);
-    else setLog("Logueado correctamente.");
+    if (error) appendLog("Login error: " + error.message);
+    else appendLog("Login solicitado / completado.");
   }
 
   async function logout() {
     await supabase.auth.signOut();
-    setLog("Logout ok.");
+    appendLog("Logout ok.");
   }
 
+  // NUEVO: handleUpload completo con replace flow y manejo de errores
   async function handleUpload() {
     if (!session || !session.access_token) {
-      setLog("No estás logueada/o. Por favor logueate.");
+      appendLog("No estás logueada/o. Por favor logueate.");
       return;
     }
-    if (!file) { setLog("Selecciona un archivo."); return; }
+    if (!file) { appendLog("Selecciona un archivo."); return; }
 
-    setLog("Pidiendo signed URL a signUpload...");
-    try {
-      const registerBody = {
-        bucket,
-        objectKey,
-        contentType: file.type || "application/octet-stream",
-        checksum: "", // opcional
-        entity_id: "00000000-0000-0000-0000-000000000001",
-        idempotency_key
-      };
+    const doRequest = async (opts = { replace: false }) => {
+      appendLog("Pidiendo signed URL a signUpload...");
+      try {
+        const registerBody = {
+          bucket,
+          objectKey,
+          contentType: file.type || "application/octet-stream",
+          checksum: "", // opcional
+          entity_id: "00000000-0000-0000-0000-000000000001",
+          idempotency_key,
+          ...(opts.replace ? { replace: true } : {})
+        };
 
-      const resp = await fetch(SIGNUPLOAD_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${session.access_token}`
-        },
-        body: JSON.stringify(registerBody)
-      });
+        const resp = await fetch(SIGNUPLOAD_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${session.access_token}`
+          },
+          body: JSON.stringify(registerBody)
+        });
 
-      if (!resp.ok) {
-        const txt = await resp.text();
-        setLog("signUpload error: " + resp.status + " - " + txt);
-        return;
+        // caso 409: conflicto (archivo existe / idempotency conflict)
+        if (resp.status === 409) {
+          let js = null;
+          try { js = await resp.json(); } catch(e) { js = null; }
+          appendLog("Respuesta 409: ya existe un archivo con ese nombre / conflicto de idempotencia.");
+          const existingVersion = js?.existing?.version || js?.detail || "";
+          const confirmReplace = window.confirm(
+            `Ya existe un archivo con ese nombre ${existingVersion ? "(versión: "+existingVersion+")" : ""}.\n` +
+            "¿Querés reemplazarlo (se creará una nueva versión)?\n\nAceptar = Reemplazar / Cancelar = Cambiar nombre"
+          );
+          if (confirmReplace) {
+            appendLog("Usuario confirmó reemplazo. Reintentando con replace:true ...");
+            return doRequest({ replace: true });
+          } else {
+            appendLog("Operación cancelada por usuario. Cambiá el nombre del archivo o idempotency_key.");
+            return null;
+          }
+        }
+
+        // error no-ok
+        if (!resp.ok) {
+          const txt = await resp.text().catch(()=>null);
+          let parsed = null;
+          try { parsed = JSON.parse(txt); } catch(e) { parsed = null; }
+          appendLog("signUpload error: " + resp.status + " - " + (parsed?.error || txt || resp.statusText));
+          return { error: true, status: resp.status, body: parsed || txt };
+        }
+
+        const js = await resp.json();
+        const signedUrl = js.signedUrl || js.signed_url || js.uploadUrl || js.upload_url || js.signedUploadUrl;
+        if (!signedUrl) {
+          appendLog("No se obtuvo signedUrl: " + JSON.stringify(js));
+          return { error: true, detail: "no_signed_url", body: js };
+        }
+
+        // OK, subir archivo con PUT
+        appendLog("Subiendo el archivo al signed URL con PUT...");
+        const putResp = await fetch(signedUrl, {
+          method: "PUT",
+          headers: {
+            "Content-Type": file.type || "application/octet-stream"
+          },
+          body: file
+        });
+        if (!putResp.ok) {
+          const txt2 = await putResp.text().catch(()=>null);
+          appendLog("PUT error: " + putResp.status + " - " + (txt2 || putResp.statusText));
+          return { error: true, status: putResp.status, body: txt2 };
+        }
+
+        appendLog("Archivo subido correctamente. Esperando webhook/registro en tabla documents.");
+        return { ok: true, document_id: js.document_id || js.documentId || null, trace_id: js.trace_id || js.traceId || null };
+
+      } catch (err) {
+        appendLog("Exception: " + (err?.message || JSON.stringify(err)));
+        return { error: true, exception: String(err) };
       }
+    };
 
-      const js = await resp.json();
-      // Se asume retorno: { ok:true, signedUrl: "...", signedHeaders: {...}, metadata: {...} }
-      const signedUrl = js.signedUrl || js.signed_url || js.signedUrl;
-      if (!signedUrl) {
-        setLog("No se obtuvo signedUrl: " + JSON.stringify(js));
-        return;
-      }
-
-      setLog("Subiendo el archivo al signed URL con PUT...");
-      const putResp = await fetch(signedUrl, {
-        method: "PUT",
-        headers: {
-          "Content-Type": file.type || "application/octet-stream"
-        },
-        body: file
-      });
-      if (!putResp.ok) {
-        const txt = await putResp.text();
-        setLog("PUT error: " + putResp.status + " - " + txt);
-        return;
-      }
-
-      setLog("Archivo subido. Ahora esperar webhook/registro (ver tabla documents).");
-    } catch (err) {
-      setLog("Exception: " + (err.message || JSON.stringify(err)));
+    // Ejecuta la petición
+    const result = await doRequest();
+    if (result && result.error && result.status === 500) {
+      appendLog("\n(Servidor devolvió 500) Revisá Logs en Supabase Edge Functions -> signUpload -> Invocations/Logs");
     }
   }
 
@@ -163,7 +204,7 @@ export default function Home() {
 
       <section style={{border: "1px solid #ddd", padding: 12}}>
         <h3>Resultado / Logs</h3>
-        <pre style={{height:160, overflow:"auto", background:"#fafafa", padding:8}}>{log}</pre>
+        <pre style={{height:160, overflow:"auto", background:"#fafafa", padding:8, whiteSpace: "pre-wrap"}}>{log}</pre>
       </section>
     </div>
   );
